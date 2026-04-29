@@ -27,7 +27,7 @@ interface AuthConfig {
 export class McpAuth {
   private config: AuthConfig
   private cachedKey: { hash: string; record: McpApiKeyRecord; cachedAt: number } | null = null
-  private readonly CACHE_TTL_MS = 5 * 60 * 1000 // 5 minutes
+  private readonly CACHE_TTL_MS = 30 * 1000 // 30 seconds
 
   constructor(config: AuthConfig) {
     this.config = config

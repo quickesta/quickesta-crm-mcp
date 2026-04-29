@@ -76,14 +76,14 @@ let sessionAllowedProductIds: string[] | null = null
 let sessionProductNames: Record<string, string> = {}
 
 async function ensureAuth(apiKey: string): Promise<void> {
-  if (sessionAllowedProductIds !== null) return
-
   const result = await auth.validate(apiKey)
   if (!result.valid) throw new Error(result.error || 'Yetkilendirme başarısız')
 
   sessionAllowedProductIds = result.allowedProductIds
 
-  // Fetch product names for friendly display
+  // Fetch product names only once
+  if (Object.keys(sessionProductNames).length > 0) return
+
   try {
     const nameData = await hasura.query<{ leads: Array<{ product_id: string }> }>({
       query: `{ ${result.allowedProductIds.map((pid, i) =>
