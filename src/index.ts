@@ -233,39 +233,92 @@ async function main() {
     const { StreamableHTTPServerTransport } = await import('@modelcontextprotocol/sdk/server/streamableHttp.js')
     const { createServer } = await import('http')
 
+    // Session management: map sessionId → { server, transport }
+    const sessions = new Map<string, { server: Server; transport: InstanceType<typeof StreamableHTTPServerTransport> }>()
+
     const httpServer = createServer(async (req, res) => {
       if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'application/json' })
-        res.end(JSON.stringify({ status: 'ok', tools: allTools.length + 1 }))
+        res.end(JSON.stringify({ status: 'ok', tools: allTools.length + 1, sessions: sessions.size }))
         return
       }
 
-      if (req.url === '/mcp' && req.method === 'POST') {
-        // Reset session for each HTTP request
-        sessionAllowedProductIds = null
-        sessionProductNames = {}
-
+      // Handle all /mcp methods (POST for requests, GET for SSE, DELETE for close)
+      if (req.url?.startsWith('/mcp')) {
         const apiKey = (req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '')) as string
-        if (!apiKey) {
-          res.writeHead(401, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: 'API key gerekli. x-api-key header gönderin.' }))
+
+        if (req.method === 'POST') {
+          if (!apiKey) {
+            res.writeHead(401, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: 'API key gerekli. x-api-key header gönderin.' }))
+            return
+          }
+
+          try {
+            await ensureAuth(apiKey)
+          } catch (err) {
+            res.writeHead(403, { 'Content-Type': 'application/json' })
+            res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Yetkilendirme başarısız' }))
+            return
+          }
+
+          // Check for existing session
+          const sessionId = req.headers['mcp-session-id'] as string | undefined
+          if (sessionId && sessions.has(sessionId)) {
+            const session = sessions.get(sessionId)!
+            await session.transport.handleRequest(req, res)
+            return
+          }
+
+          // New session
+          const mcpServer = createMcpServer()
+          const transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => `sess_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`,
+          })
+
+          transport.onclose = () => {
+            const sid = (transport as any).sessionId
+            if (sid) sessions.delete(sid)
+            mcpServer.close()
+          }
+
+          await mcpServer.connect(transport)
+          await transport.handleRequest(req, res)
+
+          // Store session after first request (transport now has sessionId)
+          const newSessionId = (transport as any).sessionId
+          if (newSessionId) {
+            sessions.set(newSessionId, { server: mcpServer, transport })
+          }
           return
         }
 
-        try {
-          await ensureAuth(apiKey)
-        } catch (err) {
-          res.writeHead(403, { 'Content-Type': 'application/json' })
-          res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Yetkilendirme başarısız' }))
+        if (req.method === 'GET') {
+          // SSE stream for existing session
+          const sessionId = req.headers['mcp-session-id'] as string | undefined
+          if (sessionId && sessions.has(sessionId)) {
+            const session = sessions.get(sessionId)!
+            await session.transport.handleRequest(req, res)
+            return
+          }
+          res.writeHead(400, { 'Content-Type': 'application/json' })
+          res.end(JSON.stringify({ error: 'Geçersiz veya eksik session ID' }))
           return
         }
 
-        // Create a fresh Server + Transport per request (MCP SDK requirement)
-        const perRequestServer = createMcpServer()
-        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
-        await perRequestServer.connect(transport)
-        await transport.handleRequest(req, res)
-        return
+        if (req.method === 'DELETE') {
+          const sessionId = req.headers['mcp-session-id'] as string | undefined
+          if (sessionId && sessions.has(sessionId)) {
+            const session = sessions.get(sessionId)!
+            await session.transport.handleRequest(req, res)
+            sessions.delete(sessionId)
+            session.server.close()
+            return
+          }
+          res.writeHead(200)
+          res.end()
+          return
+        }
       }
 
       res.writeHead(404)
