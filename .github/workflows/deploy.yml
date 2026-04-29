@@ -1,0 +1,33 @@
+name: Deploy CRM MCP
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to Hetzner
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.MCP_SERVER_IP }}
+          username: root
+          key: ${{ secrets.MCP_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /opt/quickesta-mcp
+
+            echo "🔄 Rebuilding CRM MCP..."
+            docker compose build --no-cache quickesta-crm-mcp
+            docker compose up -d quickesta-crm-mcp
+
+            sleep 5
+            if curl -sf http://localhost:4800/health; then
+              echo ""
+              echo "✅ CRM MCP deployed successfully!"
+            else
+              echo "❌ Health check failed!"
+              docker compose logs quickesta-crm-mcp --tail 20
+              exit 1
+            fi
