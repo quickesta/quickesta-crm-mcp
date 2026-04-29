@@ -144,111 +144,87 @@ function resolveProductId(args: Record<string, unknown>): Record<string, unknown
   )
 }
 
-// --- MCP Server ---
+// --- MCP Server Factory ---
 
-const server = new Server(
-  { name: 'quickesta-crm', version: '1.0.0' },
-  { capabilities: { tools: {} } }
-)
+function createMcpServer(): Server {
+  const s = new Server(
+    { name: 'quickesta-crm', version: '1.0.0' },
+    { capabilities: { tools: {} } }
+  )
 
-// Add a special tool: list my products
-const myProductsTool: ToolDefinition = {
-  name: 'crm_my_products',
-  description: 'Yetkili olduğunuz CRM ürünlerini listeler. Bu tool\'u diğer tool\'lardan önce çağırarak hangi ürünlere erişiminiz olduğunu görebilirsiniz.',
-  inputSchema: { type: 'object' as const, properties: {}, required: [] },
-  handler: async () => {
-    if (!sessionAllowedProductIds) return { error: 'Henüz doğrulanmadı' }
+  s.setRequestHandler(ListToolsRequestSchema, async () => {
+    if (TRANSPORT === 'stdio' && MCP_API_KEY && !sessionAllowedProductIds) {
+      try { await ensureAuth(MCP_API_KEY) } catch { /* will fail on tool call */ }
+    }
+
+    const isSingleProduct = sessionAllowedProductIds?.length === 1
+    const autoNote = isSingleProduct ? ' (product_id otomatik — belirtmenize gerek yok)' : ''
+
+    const myProductsTool = {
+      name: 'crm_my_products',
+      description: 'Yetkili olduğunuz CRM ürünlerini listeler.',
+      inputSchema: { type: 'object' as const, properties: {}, required: [] as string[] },
+    }
 
     return {
-      products: sessionAllowedProductIds.map(pid => ({
-        product_id: pid,
-        name: sessionProductNames[pid] || 'Bilinmeyen',
-      })),
-      count: sessionAllowedProductIds.length,
-      note: sessionAllowedProductIds.length === 1
-        ? 'Tek ürününüz var — product_id otomatik kullanılacak, belirtmenize gerek yok.'
-        : 'Birden fazla ürününüz var — tool çağrılarında product_id belirtmeniz gerekebilir.',
-    }
-  },
-}
-
-toolMap.set(myProductsTool.name, myProductsTool)
-
-server.setRequestHandler(ListToolsRequestSchema, async () => {
-  // Ensure auth before listing tools (so we can customize descriptions)
-  if (TRANSPORT === 'stdio' && MCP_API_KEY && !sessionAllowedProductIds) {
-    try { await ensureAuth(MCP_API_KEY) } catch { /* will fail on tool call */ }
-  }
-
-  const isSingleProduct = sessionAllowedProductIds?.length === 1
-  const autoNote = isSingleProduct
-    ? ' (product_id otomatik — belirtmenize gerek yok)'
-    : ''
-
-  return {
-    tools: [
-      {
-        name: myProductsTool.name,
-        description: myProductsTool.description,
-        inputSchema: myProductsTool.inputSchema,
-      },
-      ...allTools.map((t) => ({
-        name: t.name,
-        description: t.description + autoNote,
-        inputSchema: {
-          ...t.inputSchema,
-          properties: {
-            ...t.inputSchema.properties,
-            // Make product_id optional in description if single product
-            ...(t.inputSchema.properties.product_id && isSingleProduct
-              ? {
-                  product_id: {
-                    ...(t.inputSchema.properties.product_id as object),
-                    description: 'Otomatik — belirtmenize gerek yok',
-                  },
-                }
-              : {}),
+      tools: [
+        myProductsTool,
+        ...allTools.map((t) => ({
+          name: t.name,
+          description: t.description + autoNote,
+          inputSchema: {
+            ...t.inputSchema,
+            properties: {
+              ...t.inputSchema.properties,
+              ...(t.inputSchema.properties.product_id && isSingleProduct
+                ? { product_id: { ...(t.inputSchema.properties.product_id as object), description: 'Otomatik — belirtmenize gerek yok' } }
+                : {}),
+            },
+            required: isSingleProduct
+              ? (t.inputSchema.required || []).filter(r => r !== 'product_id')
+              : t.inputSchema.required,
           },
-          // Remove product_id from required if single product
-          required: isSingleProduct
-            ? (t.inputSchema.required || []).filter(r => r !== 'product_id')
-            : t.inputSchema.required,
-        },
-      })),
-    ],
-  }
-})
-
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params
-
-  try {
-    // Auth
-    if (TRANSPORT === 'stdio' && MCP_API_KEY) {
-      await ensureAuth(MCP_API_KEY)
+        })),
+      ],
     }
+  })
 
-    // Special tool
-    if (name === 'crm_my_products') {
-      const result = await myProductsTool.handler(args ?? {})
+  s.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const { name, arguments: args } = request.params
+
+    try {
+      if (TRANSPORT === 'stdio' && MCP_API_KEY) {
+        await ensureAuth(MCP_API_KEY)
+      }
+
+      if (name === 'crm_my_products') {
+        if (!sessionAllowedProductIds) return { content: [{ type: 'text', text: 'Henüz doğrulanmadı' }], isError: true }
+        const result = {
+          products: sessionAllowedProductIds.map(pid => ({ product_id: pid, name: sessionProductNames[pid] || 'Bilinmeyen' })),
+          count: sessionAllowedProductIds.length,
+          note: sessionAllowedProductIds.length === 1
+            ? 'Tek ürününüz var — product_id otomatik kullanılacak, belirtmenize gerek yok.'
+            : 'Birden fazla ürününüz var — tool çağrılarında product_id belirtmeniz gerekebilir.',
+        }
+        return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+      }
+
+      const tool = toolMap.get(name)
+      if (!tool) {
+        return { content: [{ type: 'text', text: `Bilinmeyen tool: ${name}` }], isError: true }
+      }
+
+      const resolvedArgs = resolveProductId(args ?? {})
+      const result = await tool.handler(resolvedArgs)
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      return { content: [{ type: 'text', text: `Hata: ${message}` }], isError: true }
     }
+  })
 
-    const tool = toolMap.get(name)
-    if (!tool) {
-      return { content: [{ type: 'text', text: `Bilinmeyen tool: ${name}` }], isError: true }
-    }
-
-    // Auto-resolve product_id
-    const resolvedArgs = resolveProductId(args ?? {})
-
-    const result = await tool.handler(resolvedArgs)
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    return { content: [{ type: 'text', text: `Hata: ${message}` }], isError: true }
-  }
-})
+  return s
+}
 
 // --- Start ---
 
@@ -284,8 +260,10 @@ async function main() {
           return
         }
 
+        // Create a fresh Server + Transport per request (MCP SDK requirement)
+        const perRequestServer = createMcpServer()
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined })
-        await server.connect(transport)
+        await perRequestServer.connect(transport)
         await transport.handleRequest(req, res)
         return
       }
@@ -304,8 +282,9 @@ async function main() {
     if (!MCP_API_KEY) {
       console.error('UYARI: MCP_API_KEY ayarlanmadı.')
     }
+    const stdioServer = createMcpServer()
     const transport = new StdioServerTransport()
-    await server.connect(transport)
+    await stdioServer.connect(transport)
     console.error(`Quickesta CRM MCP Server (STDIO) — ${allTools.length + 1} araç`)
   }
 }
